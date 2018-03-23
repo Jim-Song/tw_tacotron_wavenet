@@ -5,6 +5,349 @@ import tensorflow as tf
 import threading
 import time
 import traceback
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
+import json
+
+
+from text import cmudict, text_to_sequence
+from util.infolog import log
+from util import audio
+
+_batches_per_group = 10
+_p_cmudict = 0.5
+_pad = 0
+
+class DataFeeder(object):
+    def __init__(self, coord, metadata_filename, hparams, queue_size=100, random_input=False):
+        self._hparams = hparams
+        self.metadata_filename = metadata_filename
+        self.coord = coord
+        #self.n = self._hparams.batch_size * self._hparams.num_GPU
+        self.n = self._hparams.batch_size
+        self._cleaner_names = [x.strip() for x in hparams.cleaners.split(',')]
+        self.threads = []
+        self._offset = 0
+        self._batch_in_queue = 0
+        self.start_time = time.time()
+        self.random_input = random_input
+        self.ct_toolong = 1
+
+        self._metadata = []
+        for item in self.metadata_filename:
+            with open(item, 'r') as f:
+                metadata_tmp = [eval(line.strip()) for line in f]
+                self._metadata = self._metadata + metadata_tmp
+        random.shuffle(self._metadata)
+
+        # Create placeholders for inputs and targets. Don't specify batch size because we want to
+        # be able to feed different sized batches at eval time.
+        self._placeholders = [
+            tf.placeholder(tf.int32, [None, None], 'inputs'),
+            tf.placeholder(tf.int32, [None], 'input_lengths'),
+            tf.placeholder(tf.float32, [None, None], 'wav'),
+            tf.placeholder(tf.float32, [None, None, hparams.num_mels], 'mel_targets'),
+            tf.placeholder(tf.float32, [None, None, hparams.num_freq], 'linear_targets'),
+            ]
+
+        # Create queue for buffering data:
+        queue = tf.FIFOQueue(queue_size, [tf.int32, tf.int32, tf.float32, tf.float32, tf.float32], name='input_queue')
+
+        self._enqueue_op = queue.enqueue(self._placeholders)
+
+        #self.inputs, self.input_lengths, self.mel_targets, self.linear_targets, self.spec_lengths = queue.dequeue()
+        self.inputs, self.input_lengths, self.wav, self.mel_targets, self.linear_targets = queue.dequeue()
+
+        self.inputs.set_shape(self._placeholders[0].shape)
+        self.input_lengths.set_shape(self._placeholders[1].shape)
+        self.wav.set_shape(self._placeholders[2].shape)
+        self.mel_targets.set_shape(self._placeholders[3].shape)
+        self.linear_targets.set_shape(self._placeholders[4].shape)
+        #self.spec_lengths.set_shape(self._placeholders[4].shape)
+
+    def thread_main(self, sess):
+        # Read a group of examples:
+        #n = self._hparams.batch_size * self._hparams.num_GPU
+        self.n = self._hparams.batch_size# * max((self._hparams.outputs_per_step - 1), 1)
+        r = self._hparams.outputs_per_step
+        stop = False
+
+
+
+        while not stop:
+
+            start = time.time()
+            examples = []
+
+            while len(examples) < self.n * _batches_per_group:
+                #print('%d batches' % _batches_per_group)
+                if self.coord.should_stop():
+                    stop = True
+                    break
+
+                next_example = None
+                while next_example is None:
+                    next_example = self._get_next_example()
+                for item in next_example:
+                    #if item is not None:
+                    examples.append(item)
+                    #else:
+                    #    self.ct_toolong += 1
+                    #    if self.ct_toolong % n == 0:
+                    #        print(self.ct_toolong)
+
+
+            # Bucket examples based on similar output sequence length for efficiency:
+            #with open('examples.json', 'w') as f:
+            #    json.dump(examples, f)
+
+            examples.sort(key=lambda x: x[1])
+            batches = []
+            for i in range(0, len(examples), self.n):
+                batches.append(examples[i:i + self.n])
+
+            # split the batches in case the big wav file induct Out Of Memory
+            def split_list(list, n):
+                output = []
+                for i in range(n):
+                    output.append(list[int(len(list) * i / n): int(len(list) * (i + 1) / n)])
+                return output
+
+            batches2 = []
+            for i, batch in enumerate(batches):
+                print('len of spec %d' % batches[i][-1][1])
+                if batches[i][-1][1] / (self._hparams.max_iters * self._hparams.outputs_per_step) > 16:
+                    del (batches[i])
+                    self.ct_toolong += 1
+                    log('a too long batch is deleted %d ' % (self.ct_toolong))
+                    # print(len(batches2))
+                elif batches[i][-1][1] / (self._hparams.max_iters * self._hparams.outputs_per_step) > 8:
+                    del (batches[i])
+                    split_batch = split_list(batch, 16)
+                    for item in split_batch:
+                        if item:
+                            batches2.append(item)
+                elif batches[i][-1][1] / (self._hparams.max_iters * self._hparams.outputs_per_step) > 4:
+                    del (batches[i])
+                    split_batch = split_list(batch, 8)
+                    for item in split_batch:
+                        if item:
+                            batches2.append(item)
+                elif batches[i][-1][1] / (self._hparams.max_iters * self._hparams.outputs_per_step) > 2:
+                    del (batches[i])
+                    split_batch = split_list(batch, 4)
+                    for item in split_batch:
+                        if item:
+                            batches2.append(item)
+                        # print(len(batches2))
+                elif batches[i][-1][1] / (self._hparams.max_iters * self._hparams.outputs_per_step) > 1:
+                    del (batches[i])
+                    split_batch = split_list(batch, 2)
+                    for item in split_batch:
+                        if item:
+                            batches2.append(item)
+                        # print(len(batches2))
+                else:
+                    batches2.append(batch)
+                    # print(len(batches2))
+            batches = batches2
+
+            log('1Generated %d batches of size %d in %.03f sec' % (len(batches), self.n, time.time() - start))
+
+            for batch in batches:
+
+                input_batch = _prepare_batch(batch, r)
+                '''
+                print('*****************************************************************************************************')
+                print('batch:')
+                print(input_batch)
+
+                for item in input_batch:
+                    print('------------------------------------------------------------------')
+                    print(item)
+                    print('------------------------------------------------------------------')
+                print('*****************************************************************************************************')
+                '''
+                '''
+                batch_size = len(input_batch[0]) / self._hparams.num_GPU
+                print('1the num of data on a single GPU is %f' % batch_size)
+                batch_size = len(input_batch[1]) / self._hparams.num_GPU
+                print('2the num of data on a single GPU is %f' % batch_size)
+                batch_size = len(input_batch[2]) / self._hparams.num_GPU
+                print('3the num of data on a single GPU is %f' % batch_size)
+                batch_size = len(input_batch[3]) / self._hparams.num_GPU
+                print('4the num of data on a single GPU is %f' % batch_size)
+
+                batch_size = input_batch[0].shape
+                print('the shape of input is ' + str(batch_size))
+                print('the shape of input is ' + str(type(input_batch[0][0][0])))
+                batch_size = input_batch[1].shape
+                print('the shape of input is ' + str(batch_size))
+                print('the shape of input is ' + str(type(input_batch[1][0])))
+                batch_size = input_batch[2].shape
+                print('the shape of input is ' + str(batch_size))
+                print('the shape of input is ' + str(type(input_batch[2][0][0][0])))
+                batch_size = input_batch[3].shape
+                print('the shape of input is ' + str(batch_size))
+                print('the shape of input is ' + str(type(input_batch[3][0][0][0])))
+                '''
+
+                # time.sleep(1)
+                #batch_size = len(input_batch[0]) / self._hparams.num_GPU
+
+                feed_dict = dict(zip(self._placeholders, input_batch))
+
+                #feed_dict = dict(zip(self._placeholders, _prepare_batch(batch, r)))
+                sess.run(self._enqueue_op, feed_dict=feed_dict)
+                self._batch_in_queue += 1
+                #print('222self._batch_in_queue:' + str(self._batch_in_queue))
+
+
+
+    def _get_next_example(self):
+
+
+        #if self._offset % 1000 == 0:
+        #    print('___________________________________________________________________________________________________')
+        #    print('time of 1000:' + str(time.time() - self.start_time))
+        #    #print('___________________________________________________________________________________________________')
+        #    self.start_time = time.time()
+
+        metas = []
+        executor = ProcessPoolExecutor(max_workers=10)
+        print('_get_next_example')
+        for i in range( int(self.n * _batches_per_group + self.n) ):
+            if self._offset >= len(self._metadata):
+                self._offset = 0
+                random.shuffle(self._metadata)
+            meta = self._metadata[self._offset]
+            self._offset += 1
+            metas.append(meta)
+        outputs = []
+        for meta in metas:
+            outputs.append(executor.submit(partial(preprocess_data, meta[1], meta[0], self.random_input)))
+        #input_data = np.asarray(text_to_sequence(text, self._cleaner_names), dtype=np.int32)
+        #linear_target, mel_target, n_frames= get_linear_and_mel_targert(wav_path=meta[0])
+        #print(meta[0] + ':' + str(time.time()-start_time))
+        #return (input_data, mel_target, linear_target, len(linear_target))
+        #try:#this error occurs constantly and it is better to use try here
+            #Error:concurrent.futures.process.BrokenProcessPool: A process in the process pool was
+            #      terminated abruptly while the future was running or pending.
+        final_output = [output.result() for output in outputs]
+        #except:
+        #    final_output = [None,]
+        return final_output
+
+
+
+
+
+
+    def start_threads(self, sess, n_threads=1):
+        for _ in range(n_threads):
+            thread = threading.Thread(target=self.thread_main, args=(sess,))
+            thread.daemon = True  # Thread will close when parent quits.
+            thread.start()
+            self.threads.append(thread)
+        return self.threads
+
+
+
+def preprocess_data(text, wav_path, random_input=False):
+    wav, linear_target, mel_target, n_frames = get_wav_linear_and_mel_targert(wav_path)
+    input_data = np.asarray(text_to_sequence(text, ['english_cleaners']), dtype=np.int32)
+
+    #if n_frames < 1000:
+    return (input_data, len(linear_target), wav, mel_target, linear_target)
+    #else:
+    #    return None
+
+
+
+def get_wav_linear_and_mel_targert(wav_path, set_spec_length=None):
+    # Load the audio to a numpy array:
+    wav = audio.load_wav(wav_path)
+    # Compute the linear-scale spectrogram from the wav:
+    spectrogram = audio.spectrogram(wav).astype(np.float32)
+    n_frames = spectrogram.shape[1]
+    # Compute a mel-scale spectrogram from the wav:
+    mel_spectrogram = audio.melspectrogram(wav).astype(np.float32)
+    # Return a tuple describing this training example:
+    if set_spec_length is not None:
+        return (spectrogram.T[:set_spec_length], mel_spectrogram.T[:set_spec_length], n_frames)
+    return (wav, spectrogram.T, mel_spectrogram.T, n_frames)
+
+
+
+
+
+def _prepare_batch(batch, outputs_per_step, set_spec_length=None):
+    #random.shuffle(batch)
+    inputs = _prepare_inputs([x[0] for x in batch])
+    # ('inputs'+str(inputs.shape))
+    input_lengths = np.asarray([len(x[0]) for x in batch], dtype=np.int32)
+    # print('input_lengths' + str(input_lengths))
+    wav = _prepare_inputs([x[2] for x in batch])
+    #wav = np.asarray([[1,2,3,4,5],[6,7,8,9,0]])
+    mel_targets = _prepare_targets([x[3] for x in batch], outputs_per_step, set_spec_length)
+    # print('mel_targets' + str(mel_targets))
+    linear_targets = _prepare_targets([x[4] for x in batch], outputs_per_step, set_spec_length)
+    #spec_lengths = np.asarray([linear_target.shape[0] for linear_target in linear_targets], dtype=np.int32)
+    #print('0:' + str(linear_targets[0].shape[0]))
+    #print('1:' + str(linear_targets[0].shape[1]))
+    #print('2:' + str(linear_targets[0].shape[2]))
+    #print('0:' + str(linear_targets[1].shape[0]))
+    #print('1:' + str(linear_targets[1].shape[1]))
+    #print('2:' + str(linear_targets[1].shape[2]))
+    return (inputs, input_lengths, wav, mel_targets, linear_targets)
+
+def _prepare_inputs(inputs, ):
+  max_len = max((len(x) for x in inputs))
+  return np.stack([_pad_input(x, max_len) for x in inputs])
+
+
+def _prepare_targets(targets, alignment, set_spec_length):
+  max_len = max((len(t) for t in targets)) + 1
+  if set_spec_length is not None:
+      max_len = set_spec_length
+  return np.stack([_pad_target(t, _round_up(max_len, alignment)) for t in targets])
+
+
+def _pad_input(x, length):
+  return np.pad(x, (0, length - x.shape[0]), mode='constant', constant_values=_pad)
+
+
+def _pad_target(t, length):
+  return np.pad(t, [(0, length - t.shape[0]), (0,0)], mode='constant', constant_values=_pad)
+
+
+def _round_up(x, multiple):
+  remainder = x % multiple
+  return x if remainder == 0 else x + multiple - remainder
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""
+import numpy as np
+import os
+import random
+import tensorflow as tf
+import threading
+import time
+import traceback
 from text import cmudict, text_to_sequence
 from util.infolog import log
 
@@ -149,3 +492,4 @@ def _pad_target(t, length):
 def _round_up(x, multiple):
   remainder = x % multiple
   return x if remainder == 0 else x + multiple - remainder
+"""

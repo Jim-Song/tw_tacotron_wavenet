@@ -34,6 +34,7 @@ class Tacotron():
     with tf.variable_scope('inference') as scope:
       is_training = linear_targets is not None
       batch_size = tf.shape(inputs)[0]
+      #self.mel_len = tf.shape(mel_targets)[1]
       hp = self._hparams
 
       # Embeddings
@@ -74,7 +75,7 @@ class Tacotron():
 
       (decoder_outputs, _), final_decoder_state, _ = tf.contrib.seq2seq.dynamic_decode(
         BasicDecoder(output_cell, helper, decoder_init_state),
-        maximum_iterations=hp.max_iters)                                        # [N, T_out/r, M*r]
+        maximum_iterations=hp.max_iters * 1000)                                        # [N, T_out/r, M*r]
 
       # Reshape outputs to be one output per entry
       mel_outputs = tf.reshape(decoder_outputs, [batch_size, -1, hp.num_mels]) # [N, T_out, M]
@@ -85,6 +86,8 @@ class Tacotron():
 
       # Grab alignments from the final decoder state:
       alignments = tf.transpose(final_decoder_state[0].alignment_history.stack(), [1, 2, 0])
+
+
 
       self.inputs = inputs
       self.input_lengths = input_lengths
@@ -116,6 +119,7 @@ class Tacotron():
       n_priority_freq = int(3000 / (hp.sample_rate * 0.5) * hp.num_freq)
       self.linear_loss = 0.5 * tf.reduce_mean(l1) + 0.5 * tf.reduce_mean(l1[:,:,0:n_priority_freq])
       self.loss = self.mel_loss + self.linear_loss
+      self.loss = self.loss
 
 
   def add_optimizer(self, global_step):
