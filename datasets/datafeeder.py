@@ -14,12 +14,12 @@ from text import cmudict, text_to_sequence
 from util.infolog import log
 from util import audio
 
-_batches_per_group = 10
+_batches_per_group = 30
 _p_cmudict = 0.5
 _pad = 0
 
 class DataFeeder(object):
-    def __init__(self, coord, metadata_filename, hparams, queue_size=100, random_input=False):
+    def __init__(self, coord, metadata_filename, hparams, queue_size=40, random_input=False):
         self._hparams = hparams
         self.metadata_filename = metadata_filename
         self.coord = coord
@@ -45,7 +45,7 @@ class DataFeeder(object):
         self._placeholders = [
             tf.placeholder(tf.int32, [None, None], 'inputs'),
             tf.placeholder(tf.int32, [None], 'input_lengths'),
-            tf.placeholder(tf.float32, [None, None], 'wav'),
+            tf.placeholder(tf.float32, None, 'wav'),
             tf.placeholder(tf.float32, [None, None, hparams.num_mels], 'mel_targets'),
             tf.placeholder(tf.float32, [None, None, hparams.num_freq], 'linear_targets'),
             ]
@@ -214,7 +214,7 @@ class DataFeeder(object):
         #    self.start_time = time.time()
 
         metas = []
-        executor = ProcessPoolExecutor(max_workers=10)
+        executor = ProcessPoolExecutor(max_workers=6)
         print('_get_next_example')
         for i in range( int(self.n * _batches_per_group + self.n) ):
             if self._offset >= len(self._metadata):
@@ -275,6 +275,9 @@ def get_wav_linear_and_mel_targert(wav_path, set_spec_length=None):
     # Return a tuple describing this training example:
     if set_spec_length is not None:
         return (spectrogram.T[:set_spec_length], mel_spectrogram.T[:set_spec_length], n_frames)
+    #wav = wav.reshape(-1, 1)
+    #wav = np.pad(wav, [[2048, 0], [0, 0]], 'constant')
+    #wav = np.pad(wav, [[2048, 0]], 'constant')
     return (wav, spectrogram.T, mel_spectrogram.T, n_frames)
 
 
@@ -282,13 +285,19 @@ def get_wav_linear_and_mel_targert(wav_path, set_spec_length=None):
 
 
 def _prepare_batch(batch, outputs_per_step, set_spec_length=None):
+    '''
+    :param batch: [(input_data, len(linear_target), wav, mel_target, linear_target) * batch_size]
+    :param outputs_per_step:
+    :param set_spec_length:
+    :return:
+    '''
     #random.shuffle(batch)
     inputs = _prepare_inputs([x[0] for x in batch])
     # ('inputs'+str(inputs.shape))
     input_lengths = np.asarray([len(x[0]) for x in batch], dtype=np.int32)
     # print('input_lengths' + str(input_lengths))
-    wav = _prepare_inputs([x[2] for x in batch])
-    #wav = np.asarray([[1,2,3,4,5],[6,7,8,9,0]])
+    #wav = _prepare_inputs([x[2] for x in batch])
+    wav = np.asarray([[1,2,3,4,5],[6,7,8,9,0]])
     mel_targets = _prepare_targets([x[3] for x in batch], outputs_per_step, set_spec_length)
     # print('mel_targets' + str(mel_targets))
     linear_targets = _prepare_targets([x[4] for x in batch], outputs_per_step, set_spec_length)

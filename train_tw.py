@@ -8,6 +8,7 @@ import time
 import tensorflow as tf
 import traceback
 import threading
+import json
 
 
 from datasets.datafeeder import DataFeeder
@@ -15,6 +16,9 @@ from hparams import hparams, hparams_debug_string
 from models import create_model
 from text import sequence_to_text
 from util import audio, infolog, plot, ValueWindow
+from wavenet import WaveNetModel, AudioReader, optimizer_factory
+from weight_norm_fbank_10782_20171124_low25_high3700_global_norm.ResCNN_wn_A_softmax_prelu_2deeper_group import ResCNN
+
 log = infolog.log
 
 
@@ -54,6 +58,14 @@ def train(log_dir, args):
   log('Using model: %s' % args.model)
   log(hparams_debug_string())
 
+  with open(args.wavenet_params, 'r') as f:
+    wavenet_params = json.load(f)
+
+  if args.batch_size:
+    hparams.batch_size = args.batch_size
+  if args.outputs_per_step:
+    hparams.outputs_per_step = args.outputs_per_step
+
   # Multi-GPU settings
   GPUs_id = eval(args.GPUs_id)
   num_GPU = len(GPUs_id)
@@ -74,6 +86,7 @@ def train(log_dir, args):
     #inputs = tf.split(inputs, hparams.num_GPU, 0)
     input_lengths = feeder.input_lengths
     #input_lengths = tf.split(input_lengths, hparams.num_GPU, 0)
+    wav_target = feeder.wav
     mel_targets = feeder.mel_targets
     #mel_targets = tf.split(mel_targets, hparams.num_GPU, 0)
     linear_targets = feeder.linear_targets
@@ -99,6 +112,11 @@ def train(log_dir, args):
       print(i)
       with tf.device('/gpu:%d' % GPU_id):
         with tf.name_scope('GPU_%d' % GPU_id):
+
+          #net = ResCNN(data=mel_targets[i], batch_size=hparams.batch_size, hyparam=hparams)
+          #net.inference()
+          #voice_print_feature = tf.reduce_mean(net.features, 0)
+
           models.append(None)
           models[i] = create_model(args.model, hparams)
           models[i].initialize(inputs=inputs, input_lengths=input_lengths,
@@ -106,12 +124,41 @@ def train(log_dir, args):
           models[i].add_loss()
 
           models[i].add_optimizer(global_step)
+
+          #models.alignment
+
           stats = add_stats(models[i])
 
 
-          tf.get_variable_scope().reuse_variables()
-          print(tf.get_variable_scope())
 
+          #tf.get_variable_scope().reuse_variables()
+          print(tf.get_variable_scope())
+          '''
+          wavenet = WaveNetModel(
+            batch_size=args.batch_size,
+            dilations=wavenet_params["dilations"],
+            filter_width=wavenet_params["filter_width"],
+            residual_channels=wavenet_params["residual_channels"],
+            dilation_channels=wavenet_params["dilation_channels"],
+            skip_channels=wavenet_params["skip_channels"],
+            quantization_channels=wavenet_params["quantization_channels"],
+            use_biases=wavenet_params["use_biases"],
+            scalar_input=wavenet_params["scalar_input"],
+            initial_filter_width=wavenet_params["initial_filter_width"],
+            histograms=False,#args.histograms,
+            global_condition_channels=None,#args.gc_channels,
+            global_condition_cardinality=None,#reader.gc_category_cardinality
+          )
+        loss_wavenet = wavenet.loss(input_batch=wav_target,
+                        global_condition_batch=None,
+                        l2_regularization_strength=None#args.l2_regularization_strength)
+                        )
+        optimizer = optimizer_factory['adam'](
+          learning_rate=1e-4,
+          momentum=0.9)
+        trainable = tf.trainable_variables()
+        optim = optimizer.minimize(loss_wavenet, var_list=trainable)
+        '''
 
 
 
@@ -149,14 +196,16 @@ def train(log_dir, args):
       def train_func(global_step, model_tacotron, time_window, loss_window, sess, saver):
         while not coord.should_stop():
           start_time = time.time()
+          loss_w = None
+          #step, loss, opt, loss_w, opt_wavenet = sess.run([global_step, model_tacotron.loss, model_tacotron.optimize, loss_wavenet, optim])
           step, loss, opt = sess.run([global_step, model_tacotron.loss, model_tacotron.optimize])
           #step, inputs = sess.run([global_step, model_tacotron.inputs])
           #print(step)
           #'''
           time_window.append(time.time() - start_time)
           loss_window.append(loss)
-          message = 'Step %-7d [%.03f avg_sec/step,  loss=%.05f, avg_loss=%.05f]' % (
-            step, time_window.average,  loss, loss_window.average)
+          message = 'Step %-7d [%.03f avg_sec/step,  loss=%.05f, avg_loss=%.05f, lossw=%.05f]' % (
+            step, time_window.average,  loss, loss_window.average, loss_w if loss_w else loss)
           log(message, slack=(step % args.checkpoint_interval == 0))
 
           # if the gradient seems to explode, then restore to the previous step
@@ -180,12 +229,18 @@ def train(log_dir, args):
             log('Saving checkpoint to: %s-%d' % (checkpoint_path, step))
             saver.save(sess, checkpoint_path, global_step=step)
             log('Saving audio and alignment...')
-            input_seq, spectrogram, alignment = sess.run([
-              model_tacotron.inputs[0], model_tacotron.linear_outputs[0], model_tacotron.alignments[0]])
+            input_seq, spectrogram, alignment, wav = sess.run([
+              model_tacotron.inputs[0], model_tacotron.linear_outputs[0], model_tacotron.alignments[0], wav_target[0]])
             waveform = audio.inv_spectrogram(spectrogram.T)
             audio.save_wav(waveform, os.path.join(log_dir, 'step-%d-audio.wav' % step))
+            audio.save_wav(wav, os.path.join(log_dir, 'step-%d-audio2.wav' % step))
             plot.plot_alignment(alignment, os.path.join(log_dir, 'step-%d-align.png' % step),
               info='%s, %s, %s, step=%d, loss=%.5f' % (args.model, commit, time_string(), step, loss))
+            print('alignment.shape: %s' % str(alignment.shape))
+            print('input_seq.shape: %s' % str(input_seq.shape))
+            print('spectrogram.shape: %s' % str(spectrogram.shape))
+            print('wav_target.shape: %s' % str(wav.shape))
+            #print('input_seq.shape: %s' % input_seq.shape)
             log('Input: %s' % sequence_to_text(input_seq))
             #'''
 
@@ -222,6 +277,10 @@ def main():
   parser.add_argument('--GPUs_id', default='[0]', help='The GPUs\' id list that will be used. Default is 0')
   parser.add_argument('--preprocess_thread', type=int, default=2, help='preprocess_thread.')
   parser.add_argument('--description', default=None, help='description of the model')
+  parser.add_argument('--batch_size', default=None, type=int, help='batch size')
+  parser.add_argument('--wavenet_params', type=str, default='./wavenet_params.json',
+                      help='JSON file with the network parameters. Default: ' + './wavenet_params.json' + '.')
+  parser.add_argument('--outputs_per_step', default=None, type=int, help='outputs_per_step')
 
 
 

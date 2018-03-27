@@ -8,7 +8,7 @@ from hparams import hparams
 
 
 def load_wav(path):
-  return librosa.core.load(path, sr=hparams.sample_rate)[0]
+  return librosa.load(path, sr=hparams.sample_rate, mono=True)[0]
 
 
 def save_wav(wav, path):
